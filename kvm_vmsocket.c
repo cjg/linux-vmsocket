@@ -45,6 +45,7 @@ MODULE_LICENSE("GPL");
 #define VMSOCKET_CONREQ_REG(dev) ((struct vmsocket_dev *)(dev))->regs
 #define VMSOCKET_CONCLR_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x4)
 #define VMSOCKET_CONSTA_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x8)
+#define VMSOCKET_WRTEND_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x12)
 
 struct vmsocket_dev {
 	void __iomem * regs;
@@ -120,14 +121,39 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 static ssize_t vmsocket_write(struct file *filp, const char __user *buf, 
 			      size_t count, loff_t *f_pos)
 {
+	int bytes_written = 0;
+	unsigned long offset = *f_pos;
 	struct vmsocket_dev *dev = filp->private_data;
+
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 
-	/* TODO: write */
+	printk(KERN_INFO "vmsocket_write\n");
+	if (!dev->base_addr) {
+	        printk(KERN_ERR "KVM_VMSOCKET: cannot write to ioaddr (NULL)\n");
+		up(&dev->sem);
+		return 0;
+	}
 
+	if (count > dev->ioaddr_size - offset) 
+		count = dev->ioaddr_size - offset;
+
+	if (count == 0) {
+		up(&dev->sem);
+		return 0;
+	}
+
+	bytes_written = copy_from_user(dev->base_addr + offset, buf, count);
+	writew(count, VMSOCKET_WRTEND_REG(dev));
+
+	if (bytes_written > 0) {
+		up(&dev->sem);
+		return -EFAULT;
+	}
+
+	*f_pos += count;
 	up(&dev->sem);
-	return 0;
+	return count;
 }
 
 static const struct file_operations vmsocket_fops = {

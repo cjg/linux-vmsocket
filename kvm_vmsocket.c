@@ -75,6 +75,7 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 	}
 
 	/* TODO: establish connection */ 
+	writew(0x5045, vmsocket_dev.regs);
 
 	filp->private_data = dev;
 	return 0;
@@ -146,8 +147,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	if (result < 0) {
 		printk(KERN_ERR "VMSocket: cannot request regions\n");
 		goto pci_disable;
-	} else 
-		printk(KERN_ERR "VMSocket: result is %d\n", result);
+	}
 
 	vmsocket_dev.ioaddr = pci_resource_start(pdev, 1);
 	vmsocket_dev.ioaddr_size = pci_resource_len(pdev, 1);

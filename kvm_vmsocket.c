@@ -1,42 +1,125 @@
-#include <linux/init.h>
-#include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/pci.h>
+#include <linux/moduleparam.h>
+#include <linux/init.h>
+
+#include <linux/kernel.h>	/* printk() */
+#include <linux/slab.h>		/* kmalloc() */
+#include <linux/fs.h>		/* everything... */
+#include <linux/errno.h>	/* error codes */
+#include <linux/types.h>	/* size_t */
 #include <linux/proc_fs.h>
-#include <linux/smp_lock.h>
-#include <asm/uaccess.h>
-#include <linux/interrupt.h>
-#include <linux/mutex.h>
+#include <linux/fcntl.h>	/* O_ACCMODE */
+#include <linux/seq_file.h>
+#include <linux/cdev.h>
+#include <linux/pci.h>
 
-typedef struct {
-    void __iomem * regs;
+#include <asm/system.h>		/* cli(), *_flags */
+#include <asm/uaccess.h>	/* copy_*_user */
 
-    void * base_addr;
+MODULE_DESCRIPTION("Guest driver for the VMSocket PCI Device.");
+MODULE_AUTHOR("Giuseppe Coviello <cjg@cruxppc.org>");
+MODULE_LICENSE("GPL");
 
-    unsigned int regaddr;
-    unsigned int reg_size;
+#define VMSOCKET_DEBUG
 
-    unsigned int ioaddr;
-    unsigned int ioaddr_size;
-    unsigned int irq;
+#undef PDEBUG             /* undef it, just in case */
+#ifdef VMSOCKET_DEBUG
+#  ifdef __KERNEL__
+     /* This one if debugging is on, and kernel space */
+#    define PDEBUG(fmt, args...) printk( KERN_ERR "kvm_vmsocket: " fmt, ## args)
+#  else
+     /* This one for user space */
+#    define PDEBUG(fmt, args...) fprintf(stderr, fmt, ## args)
+#  endif
+#else
+#  define PDEBUG(fmt, args...) /* not debugging: nothing */
+#endif
+
+#undef PDEBUGG
+#define PDEBUGG(fmt, args...) /* nothing: it's a placeholder */
+
+#ifndef VMSOCKET_MAJOR
+#define VMSOCKET_MAJOR 0   /* dynamic major by default */
+#endif
+
+struct vmsocket_dev {
+	void __iomem * regs;
+
+	void * base_addr;
+
+	unsigned int regaddr;
+	unsigned int reg_size;
+
+	unsigned int ioaddr;
+	unsigned int ioaddr_size;
+	unsigned int irq;
+
+	struct semaphore sem;
+	struct cdev cdev;
 } kvm_vmsocket_device;
 
-typedef struct {
-    kvm_vmsocket_device * master;
-    int host_fd;
-} kvm_vmsocket_slave;
+static struct vmsocket_dev vmsocket_dev;
+static atomic_t vmsocket_available = ATOMIC_INIT(1);
+int vmsocket_major = VMSOCKET_MAJOR;
+int vmsocket_minor = 0;
 
-static struct semaphore sema;
-static wait_queue_head_t wait_queue;
-static int event_present;
-static kvm_vmsocket_device kvm_vmsocket_dev;
+static int vmsocket_open(struct inode *inode, struct file *filp)
+{
+	struct vmsocket_dev *dev = &vmsocket_dev;
 
-static int kvm_vmsocket_ioctl(struct inode *, struct file *, unsigned int,
-        unsigned long);
+	PDEBUG("vmsocket_open()\n");
 
-static const struct file_operations kvm_vmsocket_ops = {
+	if(! atomic_dec_and_test (&vmsocket_available)) {
+		atomic_inc(&vmsocket_available);
+		return -EBUSY;
+	}
+
+	/* TODO: establish connection */ 
+
+	filp->private_data = dev;
+	return 0;
+}
+
+static int vmsocket_release(struct inode *inode, struct file *filp)
+{
+	/* TODO: close connection */
+
+	atomic_inc(&vmsocket_available);
+	return 0;
+}
+
+static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
+                loff_t *f_pos)
+{
+	struct vmsocket_dev *dev = filp->private_data;
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	/* TODO: read */
+
+	up(&dev->sem);
+	return 0;
+}
+
+static ssize_t vmsocket_write(struct file *filp, const char __user *buf, 
+			      size_t count, loff_t *f_pos)
+{
+	struct vmsocket_dev *dev = filp->private_data;
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	/* TODO: write */
+
+	up(&dev->sem);
+	return 0;
+}
+
+static const struct file_operations vmsocket_fops = {
     .owner   = THIS_MODULE,
-    .ioctl   = kvm_vmsocket_ioctl,
+    .open    = vmsocket_open,
+    .release = vmsocket_release,
+    .read    = vmsocket_read,
+    .write   = vmsocket_write,
 };
 
 static struct pci_device_id kvm_vmsocket_id_table[] = {
@@ -45,12 +128,72 @@ static struct pci_device_id kvm_vmsocket_id_table[] = {
 };
 MODULE_DEVICE_TABLE (pci, kvm_vmsocket_id_table);
 
-static int kvm_vmsocket_probe_device (struct pci_dev *pdev,
-        const struct pci_device_id * ent)
+static int vmsocket_probe (struct pci_dev *pdev, 
+			   const struct pci_device_id * ent)
 {
-    sema_init(&sema, 0);
-    init_waitqueue_head(&wait_queue);
-    event_present = 0;
+	int result;
+	PDEBUG("vmsocket_probe()\n");
+	
+	result = pci_enable_device(pdev);
+	
+	if (result) {
+		printk(KERN_ERR "Cannot probe VMSocket device %s: error %d\n",
+		       pci_name(pdev), result);
+		return result;
+	}
+
+	result = pci_request_regions(pdev, "kvm_vmsocket");
+	if (result < 0) {
+		printk(KERN_ERR "VMSocket: cannot request regions\n");
+		goto pci_disable;
+	} else 
+		printk(KERN_ERR "VMSocket: result is %d\n", result);
+
+	vmsocket_dev.ioaddr = pci_resource_start(pdev, 1);
+	vmsocket_dev.ioaddr_size = pci_resource_len(pdev, 1);
+
+	vmsocket_dev.base_addr = pci_iomap(pdev, 1, 0);
+	printk(KERN_INFO "VMSocket: iomap base = 0x%lu \n",
+	       (unsigned long) vmsocket_dev.base_addr);
+
+	if (!vmsocket_dev.base_addr) {
+		printk(KERN_ERR "VMSocket: cannot iomap region of size %d\n",
+		       vmsocket_dev.ioaddr_size);
+		goto pci_release;
+	}
+
+	printk(KERN_INFO "VMSocket: ioaddr = %x ioaddr_size = %d\n",
+	       vmsocket_dev.ioaddr, vmsocket_dev.ioaddr_size);
+
+	vmsocket_dev.regaddr =  pci_resource_start(pdev, 0);
+	vmsocket_dev.reg_size = pci_resource_len(pdev, 0);
+	vmsocket_dev.regs = pci_iomap(pdev, 0, 0x100);
+
+	if (!vmsocket_dev.regs) {
+		printk(KERN_ERR "VMSocket: cannot ioremap registers of size %d\n",
+		       vmsocket_dev.reg_size);
+		goto reg_release;
+	}
+
+	init_MUTEX(&vmsocket_dev.sem);
+	cdev_init(&vmsocket_dev.cdev, &vmsocket_fops);
+	vmsocket_dev.cdev.owner = THIS_MODULE;
+	vmsocket_dev.cdev.ops = &vmsocket_fops;
+	result = cdev_add(&vmsocket_dev.cdev, MKDEV(vmsocket_major, 
+						    vmsocket_minor), 1);
+	if(result)
+		printk(KERN_ERR "Error %d adding vmsocket%d", result,
+		       vmsocket_minor);
+
+	return 0;
+
+reg_release:
+	pci_iounmap(pdev, vmsocket_dev.base_addr);
+pci_release:
+	pci_release_regions(pdev);
+pci_disable:
+	pci_disable_device(pdev);
+	return -EBUSY;
 }
 
 static void kvm_vmsocket_remove_device(struct pci_dev* pdev)
@@ -58,47 +201,44 @@ static void kvm_vmsocket_remove_device(struct pci_dev* pdev)
 
 }
 
-static struct pci_driver kvm_vmsocket_pci_driver = {
-    .name        = "kvm-vmsocket",
+static struct pci_driver vmsocket_pci_driver = {
+    .name        = "kvm_vmsocket",
     .id_table    = kvm_vmsocket_id_table,
-    .probe       = kvm_vmsocket_probe_device,
+    .probe       = vmsocket_probe,
     .remove      = kvm_vmsocket_remove_device,
 };
 
-static int kvm_vmsocket_ioctl(struct inode * ino, struct file * filp,
-        unsigned int cmd, unsigned long arg)
-{
-    int result;
-    printk(KERN_CRIT "KVM_VMSOCKET: cmd: %x.\n Waiting for mutex ...\n", cmd);
-    down_interruptible(&sema);
-    switch (cmd) {
-        case 0x434f4e4e: /* CONN */
-            printk(KERN_CRIT "KVM_VMSOCKET: Connect.\n");
-            writew(cmd, kvm_vmsocket_dev.regs);
-            wait_event_interruptible(wait_queue, (event_present == 1));
-            event_present = 0;
-            result = readw(kvm_vmsocket_dev.regs + sizeof(int));
-            break;
-        default:
-            printk("KVM_VMSOCKET: bad ioctl\n");
-            result = -1;
-    }
-    up(&sema);
-    return result;
-}
 
-
-static int __init vmsocket_init(void)
+static int __init vmsocket_init_module(void)
 {
+	int result;
+	dev_t dev = 0;
+
+	if(vmsocket_major) {
+		dev = MKDEV(vmsocket_major, vmsocket_minor);
+		result = register_chrdev_region(dev, 1, "kvm_vmsocket");
+	} else {
+		result = alloc_chrdev_region(&dev, vmsocket_minor, 1,
+					     "kvm_vmsocket");
+		vmsocket_major = MAJOR(dev);
+	}
+
+	if(result < 0) {
+		printk(KERN_ERR "kvm_vmsocket: can't get major %d\n", 
+		       vmsocket_major);
+		return result;
+	}
+
+	pci_register_driver(&vmsocket_pci_driver);
+
 	return 0;
 }
-module_init(vmsocket_init);
+module_init(vmsocket_init_module);
 
 static void __exit vmsocket_exit(void)
 {
+	cdev_del(&vmsocket_dev.cdev);
+	unregister_chrdev_region(MKDEV(vmsocket_major, vmsocket_minor), 1);
 }
 module_exit(vmsocket_exit);
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Giuseppe Coviello <cjg@cruxppc.org>");
-MODULE_DESCRIPTION("Guest driver for the VMSocket PCI Device.");

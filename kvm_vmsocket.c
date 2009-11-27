@@ -42,8 +42,9 @@ MODULE_LICENSE("GPL");
 #define VMSOCKET_MAJOR 0   /* dynamic major by default */
 #endif
 
-#define VMSOCKET_CONNRQ_REG(dev) ((struct vmsocket_dev *)(dev))->regs
-#define VMSOCKET_CONNST_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x4)
+#define VMSOCKET_CONREQ_REG(dev) ((struct vmsocket_dev *)(dev))->regs
+#define VMSOCKET_CONCLR_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x4)
+#define VMSOCKET_CONSTA_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x8)
 
 struct vmsocket_dev {
 	void __iomem * regs;
@@ -76,9 +77,8 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 		return -EBUSY;
 	}
 
-	/* TODO: establish connection */ 
-	writew(0xFFFF, VMSOCKET_CONNRQ_REG(&vmsocket_dev));
-	if((status = readl(VMSOCKET_CONNST_REG(&vmsocket_dev))) < 0) {
+	writew(0xFFFF, VMSOCKET_CONREQ_REG(&vmsocket_dev));
+	if((status = readl(VMSOCKET_CONSTA_REG(&vmsocket_dev))) < 0) {
 		PDEBUG("can't establish connection.\n");
 		atomic_inc(&vmsocket_available);
 		return status;
@@ -90,11 +90,18 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 
 static int vmsocket_release(struct inode *inode, struct file *filp)
 {
-	PDEBUG("vmsocket_release()\n");
-	/* TODO: close connection */
+	struct vmsocket_dev *dev = filp->private_data;
+	int status;
 
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+	
+	writew(0xFFF, VMSOCKET_CONCLR_REG(dev));
+	if((status = readl(VMSOCKET_CONSTA_REG(&vmsocket_dev))) != 0) 
+		PDEBUG("can't close connection.\n");
 	atomic_inc(&vmsocket_available);
-	return 0;
+	up(&dev->sem);
+	return status;
 }
 
 static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,

@@ -70,7 +70,6 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 {
 	int status;
 	struct vmsocket_dev *dev = &vmsocket_dev;
-	PDEBUG("vmsocket_open()\n");
 
 	if(! atomic_dec_and_test (&vmsocket_available)) {
 		atomic_inc(&vmsocket_available);
@@ -91,6 +90,7 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 
 static int vmsocket_release(struct inode *inode, struct file *filp)
 {
+	PDEBUG("vmsocket_release()\n");
 	/* TODO: close connection */
 
 	atomic_inc(&vmsocket_available);
@@ -193,6 +193,10 @@ static int vmsocket_probe (struct pci_dev *pdev,
 		printk(KERN_ERR "Error %d adding vmsocket%d", result,
 		       vmsocket_minor);
 
+	printk(KERN_INFO 
+	       "Registered kvm_vmsocket device, major: %d minor: %d.\n",
+	       vmsocket_major, vmsocket_minor);
+
 	return 0;
 
 reg_release:
@@ -204,16 +208,20 @@ pci_disable:
 	return -EBUSY;
 }
 
-static void kvm_vmsocket_remove_device(struct pci_dev* pdev)
+static void vmsocket_remove(struct pci_dev* pdev)
 {
-
+	printk(KERN_INFO "Unregistered kvm_vmsocket device.\n");
+	pci_iounmap(pdev, vmsocket_dev.regs);
+	pci_iounmap(pdev, vmsocket_dev.base_addr);
+	pci_release_regions(pdev);
+	pci_disable_device(pdev);
 }
 
 static struct pci_driver vmsocket_pci_driver = {
     .name        = "kvm_vmsocket",
     .id_table    = kvm_vmsocket_id_table,
     .probe       = vmsocket_probe,
-    .remove      = kvm_vmsocket_remove_device,
+    .remove      = vmsocket_remove,
 };
 
 
@@ -246,6 +254,7 @@ module_init(vmsocket_init_module);
 static void __exit vmsocket_exit(void)
 {
 	cdev_del(&vmsocket_dev.cdev);
+	pci_unregister_driver (&vmsocket_pci_driver);
 	unregister_chrdev_region(MKDEV(vmsocket_major, vmsocket_minor), 1);
 }
 module_exit(vmsocket_exit);

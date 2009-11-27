@@ -42,6 +42,9 @@ MODULE_LICENSE("GPL");
 #define VMSOCKET_MAJOR 0   /* dynamic major by default */
 #endif
 
+#define VMSOCKET_CONNRQ_REG(dev) ((struct vmsocket_dev *)(dev))->regs
+#define VMSOCKET_CONNST_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x4)
+
 struct vmsocket_dev {
 	void __iomem * regs;
 
@@ -65,8 +68,8 @@ int vmsocket_minor = 0;
 
 static int vmsocket_open(struct inode *inode, struct file *filp)
 {
+	int status;
 	struct vmsocket_dev *dev = &vmsocket_dev;
-
 	PDEBUG("vmsocket_open()\n");
 
 	if(! atomic_dec_and_test (&vmsocket_available)) {
@@ -75,7 +78,12 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 	}
 
 	/* TODO: establish connection */ 
-	writew(0x5045, vmsocket_dev.regs);
+	writew(0xFFFF, VMSOCKET_CONNRQ_REG(&vmsocket_dev));
+	if((status = readl(VMSOCKET_CONNST_REG(&vmsocket_dev))) < 0) {
+		PDEBUG("can't establish connection.\n");
+		atomic_inc(&vmsocket_available);
+		return status;
+	}
 
 	filp->private_data = dev;
 	return 0;

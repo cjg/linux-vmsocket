@@ -38,34 +38,40 @@ MODULE_LICENSE("GPL");
 #undef PDEBUGG
 #define PDEBUGG(fmt, args...) /* nothing: it's a placeholder */
 
+#define VMSOCKET_ERR(fmt, args...) printk( KERN_ERR "kvm_vmsocket: " fmt "\n", ## args)
+#define VMSOCKET_INFO(fmt, args...) printk( KERN_INFO "kvm_vmsocket: " fmt "\n", ## args)
+
 #ifndef VMSOCKET_MAJOR
 #define VMSOCKET_MAJOR 0   /* dynamic major by default */
 #endif
 
-#define VMSOCKET_CONREQ_REG(dev) ((struct vmsocket_dev *)(dev))->regs
-#define VMSOCKET_CONCLR_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x10)
-#define VMSOCKET_CONSTA_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x20)
-#define VMSOCKET_WRTEND_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x40)
-#define VMSOCKET_REDBGN_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x50)
-#define VMSOCKET_WRITE_COMMIT_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x60)
+/* Registers */
+/* Read Only */
+#define VMSOCKET_STATUS_L_REG(dev)       ((dev)->regs)
+/* Write Only */
+#define VMSOCKET_CONNECT_W_REG(dev)      ((dev)->regs + 0x20)
+#define VMSOCKET_CLOSE_W_REG(dev)        ((dev)->regs + 0x30)
+#define VMSOCKET_WRITE_COMMIT_L_REG(dev) ((dev)->regs + 0x40)
 
 struct vmsocket_dev {
 	void __iomem * regs;
+	uint32_t regaddr;
+	uint32_t reg_size;
 
-	void * base_addr;
+	void * host_inbuffer;
+	void * guest_inbuffer;
+	uint32_t inbuffer_size;
+	uint32_t inbuffer_length;
+	uint32_t inbuffer_addr;
 
-	unsigned int regaddr;
-	unsigned int reg_size;
-
-	unsigned int ioaddr;
-	unsigned int ioaddr_size;
-	unsigned int irq;
+	void * host_outbuffer;
+	void * guest_outbuffer;
+	uint32_t outbuffer_size;
+	uint32_t outbuffer_length;
+	uint32_t outbuffer_addr;
 
 	struct semaphore sem;
 	struct cdev cdev;
-
-	void *outbuffer;
-	uint32_t outbuffer_length;
 } kvm_vmsocket_device;
 
 static struct vmsocket_dev vmsocket_dev;
@@ -73,12 +79,12 @@ static atomic_t vmsocket_available = ATOMIC_INIT(1);
 int vmsocket_major = VMSOCKET_MAJOR;
 int vmsocket_minor = 0;
 
-static void flush(struct vmsocket_dev *dev) 
+static void vmsocket_write_commit(struct vmsocket_dev *dev) 
 {
 	if(dev->outbuffer_length > 0) {
-		PDEBUG("write_commit(): length: %u\n", dev->outbuffer_length);
-		memmove(dev->base_addr, dev->outbuffer, dev->outbuffer_length);
-		writel(dev->outbuffer_length, VMSOCKET_WRITE_COMMIT_REG(dev));
+		memmove(dev->host_outbuffer, dev->guest_outbuffer, 
+			dev->outbuffer_length);
+		writel(dev->outbuffer_length, VMSOCKET_WRITE_COMMIT_L_REG(dev));
 		dev->outbuffer_length = 0;
 	}
 }
@@ -88,14 +94,14 @@ static int vmsocket_open(struct inode *inode, struct file *filp)
 	int status;
 	struct vmsocket_dev *dev = &vmsocket_dev;
 
-	if(! atomic_dec_and_test (&vmsocket_available)) {
+	if(!atomic_dec_and_test(&vmsocket_available)) {
 		atomic_inc(&vmsocket_available);
 		return -EBUSY;
 	}
 
-	writew(0xFFFF, VMSOCKET_CONREQ_REG(&vmsocket_dev));
-	if((status = readl(VMSOCKET_CONSTA_REG(&vmsocket_dev))) < 0) {
-		PDEBUG("can't establish connection.\n");
+	writew(0xFFFF, VMSOCKET_CONNECT_W_REG(&vmsocket_dev));
+	if((status = readl(VMSOCKET_STATUS_L_REG(&vmsocket_dev))) < 0) {
+		VMSOCKET_ERR("can't establish connection.");
 		atomic_inc(&vmsocket_available);
 		return status;
 	}
@@ -112,10 +118,10 @@ static int vmsocket_release(struct inode *inode, struct file *filp)
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 	
-	flush(dev);
-	writew(0xFFFF, VMSOCKET_CONCLR_REG(dev));
-	if((status = readl(VMSOCKET_CONSTA_REG(&vmsocket_dev))) != 0) 
-		PDEBUG("can't close connection.\n");
+	vmsocket_write_commit(dev);
+	writew(0xFFFF, VMSOCKET_CLOSE_W_REG(dev));
+	if((status = readl(VMSOCKET_STATUS_L_REG(&vmsocket_dev))) != 0) 
+		VMSOCKET_ERR("can't close connection.");
 	atomic_inc(&vmsocket_available);
 	up(&dev->sem);
 	return status;
@@ -176,18 +182,10 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 
-	if (!dev->base_addr) {
-	        printk(KERN_ERR "KVM_VMSOCKET: cannot write to ioaddr (NULL)\n");
-		up(&dev->sem);
-		return 0;
-	}
-
 	offset = dev->outbuffer_length;
 
-	PDEBUG("vmsocket_write(): count: %u offset: %u\n", count, offset);
-
-	if (count > dev->ioaddr_size - offset) 
-		count = dev->ioaddr_size - offset;
+	if (count > dev->outbuffer_size - offset) 
+		count = dev->outbuffer_size - offset;
 
 	if (count == 0) {
 		*f_pos = 0;
@@ -195,10 +193,15 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 		return 0;
 	}
 
-	copy_from_user(dev->outbuffer + dev->outbuffer_length, buf, count);
+	if(copy_from_user(dev->guest_outbuffer 
+			  + dev->outbuffer_length, buf, count) > 0) {
+		up(&dev->sem);
+		return -EFAULT;
+	}
+
 	dev->outbuffer_length += count;
-	if(dev->outbuffer_length == dev->ioaddr_size)
-		flush(dev);
+	if(dev->outbuffer_length == dev->outbuffer_size)
+		vmsocket_write_commit(dev);
 
 	*f_pos += count;
 	up(&dev->sem);
@@ -233,47 +236,52 @@ static int vmsocket_probe (struct pci_dev *pdev,
 			   const struct pci_device_id * ent)
 {
 	int result;
-	PDEBUG("vmsocket_probe()\n");
-	
+
 	result = pci_enable_device(pdev);
-	
+
 	if (result) {
-		printk(KERN_ERR "Cannot probe VMSocket device %s: error %d\n",
+		VMSOCKET_ERR("cannot probe device %s: error %d.",
 		       pci_name(pdev), result);
 		return result;
 	}
 
 	result = pci_request_regions(pdev, "kvm_vmsocket");
 	if (result < 0) {
-		printk(KERN_ERR "VMSocket: cannot request regions\n");
+		VMSOCKET_ERR("cannot request regions.");
 		goto pci_disable;
 	}
 
-	vmsocket_dev.ioaddr = pci_resource_start(pdev, 1);
-	vmsocket_dev.ioaddr_size = pci_resource_len(pdev, 1) / 4;
-
-	vmsocket_dev.base_addr = pci_iomap(pdev, 1, 0);
-	printk(KERN_INFO "VMSocket: iomap base = 0x%lu \n",
-	       (unsigned long) vmsocket_dev.base_addr);
-
-	if (!vmsocket_dev.base_addr) {
-		printk(KERN_ERR "VMSocket: cannot iomap region of size %d\n",
-		       vmsocket_dev.ioaddr_size);
-		goto pci_release;
-	}
-
-	printk(KERN_INFO "VMSocket: ioaddr = %x ioaddr_size = %d\n",
-	       vmsocket_dev.ioaddr, vmsocket_dev.ioaddr_size);
-
+	/* Registers */
 	vmsocket_dev.regaddr =  pci_resource_start(pdev, 0);
 	vmsocket_dev.reg_size = pci_resource_len(pdev, 0);
 	vmsocket_dev.regs = pci_iomap(pdev, 0, 0x100);
-
 	if (!vmsocket_dev.regs) {
-		printk(KERN_ERR "VMSocket: cannot ioremap registers of size %d\n",
-		       vmsocket_dev.reg_size);
+		VMSOCKET_ERR("cannot ioremap registers.");
 		goto reg_release;
 	}
+	
+	/* I/O Buffers */
+	vmsocket_dev.inbuffer_addr = pci_resource_start(pdev, 1);
+	vmsocket_dev.host_inbuffer = pci_iomap(pdev, 1, 0);
+	vmsocket_dev.inbuffer_size = pci_resource_len(pdev, 1);
+	vmsocket_dev.inbuffer_length = 0;
+	if (!vmsocket_dev.host_inbuffer) {
+		VMSOCKET_ERR("cannot ioremap input buffer.");
+		goto in_release;
+	}
+	vmsocket_dev.guest_inbuffer = kmalloc(vmsocket_dev.inbuffer_length, 
+					      GFP_KERNEL);
+
+	vmsocket_dev.outbuffer_addr = pci_resource_start(pdev, 2);
+	vmsocket_dev.host_outbuffer = pci_iomap(pdev, 2, 0);
+	vmsocket_dev.outbuffer_size = pci_resource_len(pdev, 2);
+	vmsocket_dev.outbuffer_length = 0;
+	if (!vmsocket_dev.host_outbuffer) {
+		VMSOCKET_ERR("cannot ioremap output buffer.");
+		goto out_release;
+	}
+	vmsocket_dev.guest_outbuffer = kmalloc(vmsocket_dev.outbuffer_size, 
+					       GFP_KERNEL);
 
 	init_MUTEX(&vmsocket_dev.sem);
 	cdev_init(&vmsocket_dev.cdev, &vmsocket_fops);
@@ -282,34 +290,38 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	result = cdev_add(&vmsocket_dev.cdev, MKDEV(vmsocket_major, 
 						    vmsocket_minor), 1);
 	if(result)
-		printk(KERN_ERR "Error %d adding vmsocket%d", result,
-		       vmsocket_minor);
+		VMSOCKET_ERR("error %d adding vmsocket%d", result, 
+			     vmsocket_minor);
 
-	vmsocket_dev.outbuffer = kmalloc(vmsocket_dev.ioaddr_size, GFP_KERNEL);
-	vmsocket_dev.outbuffer_length = 0;
-
-	printk(KERN_INFO 
-	       "Registered kvm_vmsocket device, major: %d minor: %d.\n",
-	       vmsocket_major, vmsocket_minor);
+	VMSOCKET_INFO("registered device, major: %d minor: %d.",
+		      vmsocket_major, vmsocket_minor);
+	VMSOCKET_INFO("input buffer size: %d.", vmsocket_dev.inbuffer_size);
+	VMSOCKET_INFO("output buffer size: %d.", vmsocket_dev.outbuffer_size);
 
 	return 0;
 
-reg_release:
-	pci_iounmap(pdev, vmsocket_dev.base_addr);
-pci_release:
+  out_release:
+	kfree(vmsocket_dev.guest_inbuffer);
+	pci_iounmap(pdev, vmsocket_dev.host_inbuffer);
+  in_release:
+	pci_iounmap(pdev, vmsocket_dev.regs);
+  reg_release:
 	pci_release_regions(pdev);
-pci_disable:
+  pci_disable:
 	pci_disable_device(pdev);
 	return -EBUSY;
 }
 
 static void vmsocket_remove(struct pci_dev* pdev)
 {
-	printk(KERN_INFO "Unregistered kvm_vmsocket device.\n");
+	VMSOCKET_INFO("unregistered device.");
 	pci_iounmap(pdev, vmsocket_dev.regs);
-	pci_iounmap(pdev, vmsocket_dev.base_addr);
+	pci_iounmap(pdev, vmsocket_dev.host_inbuffer);
+	pci_iounmap(pdev, vmsocket_dev.host_outbuffer);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
+	kfree(vmsocket_dev.guest_inbuffer);
+	kfree(vmsocket_dev.guest_outbuffer);
 }
 
 static struct pci_driver vmsocket_pci_driver = {
@@ -335,12 +347,14 @@ static int __init vmsocket_init_module(void)
 	}
 
 	if(result < 0) {
-		printk(KERN_ERR "kvm_vmsocket: can't get major %d\n", 
-		       vmsocket_major);
+		VMSOCKET_ERR("can't get major %d.", vmsocket_major);
 		return result;
 	}
 
-	pci_register_driver(&vmsocket_pci_driver);
+	if((result = pci_register_driver(&vmsocket_pci_driver)) != 0) {
+		VMSOCKET_ERR("can't register PCI driver.");
+		return result;
+	}
 
 	return 0;
 }

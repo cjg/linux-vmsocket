@@ -26,7 +26,7 @@ MODULE_LICENSE("GPL");
 #ifdef VMSOCKET_DEBUG
 #  ifdef __KERNEL__
      /* This one if debugging is on, and kernel space */
-#    define PDEBUG(fmt, args...) printk( KERN_ERR "kvm_vmsocket: " fmt, ## args)
+#    define PDEBUG(fmt, args...) printk( KERN_CRIT "kvm_vmsocket: " fmt, ## args)
 #  else
      /* This one for user space */
 #    define PDEBUG(fmt, args...) fprintf(stderr, fmt, ## args)
@@ -43,9 +43,11 @@ MODULE_LICENSE("GPL");
 #endif
 
 #define VMSOCKET_CONREQ_REG(dev) ((struct vmsocket_dev *)(dev))->regs
-#define VMSOCKET_CONCLR_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x4)
-#define VMSOCKET_CONSTA_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x8)
-#define VMSOCKET_WRTEND_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x12)
+#define VMSOCKET_CONCLR_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x10)
+#define VMSOCKET_CONSTA_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x20)
+#define VMSOCKET_WRTEND_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x40)
+#define VMSOCKET_REDBGN_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x50)
+#define VMSOCKET_WRITE_COMMIT_REG(dev) (((struct vmsocket_dev *)(dev))->regs + 0x60)
 
 struct vmsocket_dev {
 	void __iomem * regs;
@@ -61,12 +63,25 @@ struct vmsocket_dev {
 
 	struct semaphore sem;
 	struct cdev cdev;
+
+	void *outbuffer;
+	uint32_t outbuffer_length;
 } kvm_vmsocket_device;
 
 static struct vmsocket_dev vmsocket_dev;
 static atomic_t vmsocket_available = ATOMIC_INIT(1);
 int vmsocket_major = VMSOCKET_MAJOR;
 int vmsocket_minor = 0;
+
+static void flush(struct vmsocket_dev *dev) 
+{
+	if(dev->outbuffer_length > 0) {
+		PDEBUG("write_commit(): length: %u\n", dev->outbuffer_length);
+		memmove(dev->base_addr, dev->outbuffer, dev->outbuffer_length);
+		writel(dev->outbuffer_length, VMSOCKET_WRITE_COMMIT_REG(dev));
+		dev->outbuffer_length = 0;
+	}
+}
 
 static int vmsocket_open(struct inode *inode, struct file *filp)
 {
@@ -97,7 +112,8 @@ static int vmsocket_release(struct inode *inode, struct file *filp)
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 	
-	writew(0xFFF, VMSOCKET_CONCLR_REG(dev));
+	flush(dev);
+	writew(0xFFFF, VMSOCKET_CONCLR_REG(dev));
 	if((status = readl(VMSOCKET_CONSTA_REG(&vmsocket_dev))) != 0) 
 		PDEBUG("can't close connection.\n");
 	atomic_inc(&vmsocket_available);
@@ -108,29 +124,15 @@ static int vmsocket_release(struct inode *inode, struct file *filp)
 static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+#if 0
 	struct vmsocket_dev *dev = filp->private_data;
-	if (down_interruptible(&dev->sem))
-		return -ERESTARTSYS;
-
-	/* TODO: read */
-
-	up(&dev->sem);
-	return 0;
-}
-
-static ssize_t vmsocket_write(struct file *filp, const char __user *buf, 
-			      size_t count, loff_t *f_pos)
-{
-	int bytes_written = 0;
+	int bytes_read = 0;
 	unsigned long offset = *f_pos;
-	struct vmsocket_dev *dev = filp->private_data;
-
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
-
-	printk(KERN_INFO "vmsocket_write\n");
 	if (!dev->base_addr) {
-	        printk(KERN_ERR "KVM_VMSOCKET: cannot write to ioaddr (NULL)\n");
+		printk(KERN_ERR 
+		       "KVM_VMSOCKET: cannot read from ioaddr (NULL)\n");
 		up(&dev->sem);
 		return 0;
 	}
@@ -139,21 +141,77 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 		count = dev->ioaddr_size - offset;
 
 	if (count == 0) {
+		*f_pos = 0;
+		up(&dev->sem);
+		return 0;
+	}
+	
+	writew(count, VMSOCKET_REDBGN_REG(dev));
+	count = readl(VMSOCKET_CONSTA_REG(dev));
+	if (count == 0 || (int) count < 0) {
+		*f_pos = 0;
 		up(&dev->sem);
 		return 0;
 	}
 
-	bytes_written = copy_from_user(dev->base_addr + offset, buf, count);
-	writew(count, VMSOCKET_WRTEND_REG(dev));
-
-	if (bytes_written > 0) {
+	bytes_read = copy_to_user(buf, dev->base_addr, count);
+	if (bytes_read > 0) {
 		up(&dev->sem);
 		return -EFAULT;
 	}
+	
+	*f_pos += count;
+	up(&dev->sem);
+	return count;
+#endif
+	return 0;
+}
+
+static ssize_t vmsocket_write(struct file *filp, const char __user *buf, 
+			      size_t count, loff_t *f_pos)
+{
+	unsigned long offset;
+	struct vmsocket_dev *dev = filp->private_data;
+
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	if (!dev->base_addr) {
+	        printk(KERN_ERR "KVM_VMSOCKET: cannot write to ioaddr (NULL)\n");
+		up(&dev->sem);
+		return 0;
+	}
+
+	offset = dev->outbuffer_length;
+
+	PDEBUG("vmsocket_write(): count: %u offset: %u\n", count, offset);
+
+	if (count > dev->ioaddr_size - offset) 
+		count = dev->ioaddr_size - offset;
+
+	if (count == 0) {
+		*f_pos = 0;
+		up(&dev->sem);
+		return 0;
+	}
+
+	copy_from_user(dev->outbuffer + dev->outbuffer_length, buf, count);
+	dev->outbuffer_length += count;
+	if(dev->outbuffer_length == dev->ioaddr_size)
+		flush(dev);
 
 	*f_pos += count;
 	up(&dev->sem);
 	return count;
+}
+
+int vmsocket_ioctl(struct inode *inode,	/* see include/linux/fs.h */
+		   struct file *file,	/* ditto */
+		   unsigned int ioctl_num,	/* number and param for ioctl */
+		   unsigned long ioctl_param) {
+	
+	PDEBUG("ioctl(): num: %u param: %lu\n", ioctl_num, ioctl_param);
+	return 0;
 }
 
 static const struct file_operations vmsocket_fops = {
@@ -162,6 +220,7 @@ static const struct file_operations vmsocket_fops = {
     .release = vmsocket_release,
     .read    = vmsocket_read,
     .write   = vmsocket_write,
+    .ioctl   = vmsocket_ioctl,
 };
 
 static struct pci_device_id kvm_vmsocket_id_table[] = {
@@ -191,7 +250,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	}
 
 	vmsocket_dev.ioaddr = pci_resource_start(pdev, 1);
-	vmsocket_dev.ioaddr_size = pci_resource_len(pdev, 1);
+	vmsocket_dev.ioaddr_size = pci_resource_len(pdev, 1) / 4;
 
 	vmsocket_dev.base_addr = pci_iomap(pdev, 1, 0);
 	printk(KERN_INFO "VMSocket: iomap base = 0x%lu \n",
@@ -225,6 +284,9 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	if(result)
 		printk(KERN_ERR "Error %d adding vmsocket%d", result,
 		       vmsocket_minor);
+
+	vmsocket_dev.outbuffer = kmalloc(vmsocket_dev.ioaddr_size, GFP_KERNEL);
+	vmsocket_dev.outbuffer_length = 0;
 
 	printk(KERN_INFO 
 	       "Registered kvm_vmsocket device, major: %d minor: %d.\n",

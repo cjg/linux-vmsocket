@@ -52,6 +52,7 @@ MODULE_LICENSE("GPL");
 #define VMSOCKET_CONNECT_W_REG(dev)      ((dev)->regs + 0x20)
 #define VMSOCKET_CLOSE_W_REG(dev)        ((dev)->regs + 0x30)
 #define VMSOCKET_WRITE_COMMIT_L_REG(dev) ((dev)->regs + 0x40)
+#define VMSOCKET_READ_L_REG(dev)         ((dev)->regs + 0x60)
 
 struct vmsocket_dev {
 	void __iomem * regs;
@@ -62,11 +63,13 @@ struct vmsocket_dev {
 	void * guest_inbuffer;
 	uint32_t inbuffer_size;
 	uint32_t inbuffer_length;
+	uint32_t inbuffer_addr;
 
 	void * host_outbuffer;
 	void * guest_outbuffer;
 	uint32_t outbuffer_size;
 	uint32_t outbuffer_length;
+	uint32_t outbuffer_addr;
 
 	struct semaphore sem;
 	struct cdev cdev;
@@ -128,47 +131,29 @@ static int vmsocket_release(struct inode *inode, struct file *filp)
 static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-#if 0
 	struct vmsocket_dev *dev = filp->private_data;
-	int bytes_read = 0;
-	unsigned long offset = *f_pos;
+
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
-	if (!dev->base_addr) {
-		printk(KERN_ERR 
-		       "KVM_VMSOCKET: cannot read from ioaddr (NULL)\n");
-		up(&dev->sem);
-		return 0;
-	}
 
-	if (count > dev->ioaddr_size - offset) 
-		count = dev->ioaddr_size - offset;
+	vmsocket_write_commit(dev);
+	writel(count, VMSOCKET_READ_L_REG(dev));
+	count = readl(VMSOCKET_STATUS_L_REG(dev));
 
 	if (count == 0) {
 		*f_pos = 0;
 		up(&dev->sem);
 		return 0;
 	}
-	
-	writew(count, VMSOCKET_REDBGN_REG(dev));
-	count = readl(VMSOCKET_CONSTA_REG(dev));
-	if (count == 0 || (int) count < 0) {
-		*f_pos = 0;
-		up(&dev->sem);
-		return 0;
-	}
 
-	bytes_read = copy_to_user(buf, dev->base_addr, count);
-	if (bytes_read > 0) {
+	if(copy_to_user(buf, dev->host_inbuffer, count) > 0) {
 		up(&dev->sem);
 		return -EFAULT;
 	}
-	
+
 	*f_pos += count;
 	up(&dev->sem);
 	return count;
-#endif
-	return 0;
 }
 
 static ssize_t vmsocket_write(struct file *filp, const char __user *buf, 
@@ -206,6 +191,18 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 	return count;
 }
 
+static int vmsocket_flush(struct file *filp) {
+	struct vmsocket_dev *dev = filp->private_data;
+
+	if (down_interruptible(&dev->sem))
+		return -ERESTARTSYS;
+
+	vmsocket_write_commit(dev);
+
+	up(&dev->sem);
+	return 0;
+}
+
 int vmsocket_ioctl(struct inode *inode,	/* see include/linux/fs.h */
 		   struct file *file,	/* ditto */
 		   unsigned int ioctl_num,	/* number and param for ioctl */
@@ -221,7 +218,9 @@ static const struct file_operations vmsocket_fops = {
     .release = vmsocket_release,
     .read    = vmsocket_read,
     .write   = vmsocket_write,
-    .ioctl   = vmsocket_ioctl,
+    .flush   = vmsocket_flush,
+    /* .fsync   = vmsocket_fsync, */
+    /* .ioctl   = vmsocket_ioctl, */
 };
 
 static struct pci_device_id kvm_vmsocket_id_table[] = {
@@ -259,6 +258,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	}
 	
 	/* I/O Buffers */
+	vmsocket_dev.inbuffer_addr =  pci_resource_start(pdev, 1);
 	vmsocket_dev.host_inbuffer = pci_iomap(pdev, 1, 0);
 	vmsocket_dev.inbuffer_size = pci_resource_len(pdev, 1);
 	vmsocket_dev.inbuffer_length = 0;
@@ -269,6 +269,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	vmsocket_dev.guest_inbuffer = kmalloc(vmsocket_dev.inbuffer_length, 
 					      GFP_KERNEL);
 
+	vmsocket_dev.outbuffer_addr =  pci_resource_start(pdev, 2);
 	vmsocket_dev.host_outbuffer = pci_iomap(pdev, 2, 0);
 	vmsocket_dev.outbuffer_size = pci_resource_len(pdev, 2);
 	vmsocket_dev.outbuffer_length = 0;
@@ -291,9 +292,12 @@ static int vmsocket_probe (struct pci_dev *pdev,
 
 	VMSOCKET_INFO("registered device, major: %d minor: %d.",
 		      vmsocket_major, vmsocket_minor);
-	VMSOCKET_INFO("input buffer size: %d.", vmsocket_dev.inbuffer_size);
-	VMSOCKET_INFO("output buffer size: %d.", vmsocket_dev.outbuffer_size);
+	VMSOCKET_INFO("input buffer size: %d @ 0x%x.", 
+		      vmsocket_dev.inbuffer_size, vmsocket_dev.inbuffer_addr);
+	VMSOCKET_INFO("output buffer size: %d @ 0x%x.", 
+		      vmsocket_dev.outbuffer_size, vmsocket_dev.outbuffer_addr);
 
+	memset(vmsocket_dev.host_inbuffer, 'a', 100);
 	return 0;
 
   out_release:

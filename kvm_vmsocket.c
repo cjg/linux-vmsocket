@@ -62,13 +62,11 @@ struct vmsocket_dev {
 	void * guest_inbuffer;
 	uint32_t inbuffer_size;
 	uint32_t inbuffer_length;
-	uint32_t inbuffer_addr;
 
 	void * host_outbuffer;
 	void * guest_outbuffer;
 	uint32_t outbuffer_size;
 	uint32_t outbuffer_length;
-	uint32_t outbuffer_addr;
 
 	struct semaphore sem;
 	struct cdev cdev;
@@ -261,7 +259,6 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	}
 	
 	/* I/O Buffers */
-	vmsocket_dev.inbuffer_addr = pci_resource_start(pdev, 1);
 	vmsocket_dev.host_inbuffer = pci_iomap(pdev, 1, 0);
 	vmsocket_dev.inbuffer_size = pci_resource_len(pdev, 1);
 	vmsocket_dev.inbuffer_length = 0;
@@ -272,7 +269,6 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	vmsocket_dev.guest_inbuffer = kmalloc(vmsocket_dev.inbuffer_length, 
 					      GFP_KERNEL);
 
-	vmsocket_dev.outbuffer_addr = pci_resource_start(pdev, 2);
 	vmsocket_dev.host_outbuffer = pci_iomap(pdev, 2, 0);
 	vmsocket_dev.outbuffer_size = pci_resource_len(pdev, 2);
 	vmsocket_dev.outbuffer_length = 0;

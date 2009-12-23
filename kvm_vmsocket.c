@@ -59,14 +59,12 @@ struct vmsocket_dev {
 	uint32_t regaddr;
 	uint32_t reg_size;
 
-	void * host_inbuffer;
-	void * guest_inbuffer;
+	void * inbuffer;
 	uint32_t inbuffer_size;
 	uint32_t inbuffer_length;
 	uint32_t inbuffer_addr;
 
-	void * host_outbuffer;
-	void * guest_outbuffer;
+	void * outbuffer;
 	uint32_t outbuffer_size;
 	uint32_t outbuffer_length;
 	uint32_t outbuffer_addr;
@@ -84,8 +82,6 @@ int vmsocket_minor = 0;
 static void vmsocket_write_commit(struct vmsocket_dev *dev) 
 {
 	if(dev->outbuffer_length > 0) {
-		memmove(dev->host_outbuffer, dev->guest_outbuffer, 
-			dev->outbuffer_length);
 		writel(dev->outbuffer_length, VMSOCKET_WRITE_COMMIT_L_REG(dev));
 		dev->outbuffer_length = 0;
 	}
@@ -147,7 +143,7 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 		return 0;
 	}
 
-	if(copy_to_user(buf, dev->host_inbuffer, count) > 0) {
+	if(copy_to_user(buf, dev->inbuffer, count) > 0) {
 		up(&dev->sem);
 		return -EFAULT;
 	}
@@ -177,8 +173,8 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 		return 0;
 	}
 
-	if(copy_from_user(dev->guest_outbuffer 
-			  + dev->outbuffer_length, buf, count) > 0) {
+	if(copy_from_user(dev->outbuffer + dev->outbuffer_length, buf, count) 
+	   > 0) {
 		up(&dev->sem);
 		return -EFAULT;
 	}
@@ -260,26 +256,22 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	
 	/* I/O Buffers */
 	vmsocket_dev.inbuffer_addr =  pci_resource_start(pdev, 1);
-	vmsocket_dev.host_inbuffer = pci_iomap(pdev, 1, 0);
+	vmsocket_dev.inbuffer = pci_iomap(pdev, 1, 0);
 	vmsocket_dev.inbuffer_size = pci_resource_len(pdev, 1);
 	vmsocket_dev.inbuffer_length = 0;
-	if (!vmsocket_dev.host_inbuffer) {
+	if (!vmsocket_dev.inbuffer) {
 		VMSOCKET_ERR("cannot ioremap input buffer.");
 		goto in_release;
 	}
-	vmsocket_dev.guest_inbuffer = kmalloc(vmsocket_dev.inbuffer_length, 
-					      GFP_KERNEL);
 
 	vmsocket_dev.outbuffer_addr =  pci_resource_start(pdev, 2);
-	vmsocket_dev.host_outbuffer = pci_iomap(pdev, 2, 0);
+	vmsocket_dev.outbuffer = pci_iomap(pdev, 2, 0);
 	vmsocket_dev.outbuffer_size = pci_resource_len(pdev, 2);
 	vmsocket_dev.outbuffer_length = 0;
-	if (!vmsocket_dev.host_outbuffer) {
+	if (!vmsocket_dev.outbuffer) {
 		VMSOCKET_ERR("cannot ioremap output buffer.");
 		goto out_release;
 	}
-	vmsocket_dev.guest_outbuffer = kmalloc(vmsocket_dev.outbuffer_size, 
-					       GFP_KERNEL);
 
 	init_MUTEX(&vmsocket_dev.sem);
 	cdev_init(&vmsocket_dev.cdev, &vmsocket_fops);
@@ -298,8 +290,6 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	VMSOCKET_INFO("output buffer size: %d @ 0x%x.", 
 		      vmsocket_dev.outbuffer_size, vmsocket_dev.outbuffer_addr);
 
-	memset(vmsocket_dev.host_inbuffer, 'a', 100);
-
 	/* create sysfs entry */
 	if(fc == NULL)
 		fc = class_create(THIS_MODULE, "vmsocket");
@@ -309,8 +299,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	return 0;
 
   out_release:
-	kfree(vmsocket_dev.guest_inbuffer);
-	pci_iounmap(pdev, vmsocket_dev.host_inbuffer);
+	pci_iounmap(pdev, vmsocket_dev.inbuffer);
   in_release:
 	pci_iounmap(pdev, vmsocket_dev.regs);
   reg_release:
@@ -325,12 +314,10 @@ static void vmsocket_remove(struct pci_dev* pdev)
 	VMSOCKET_INFO("unregistered device.");
 	device_destroy(fc, vmsocket_dev.cdev.dev);
 	pci_iounmap(pdev, vmsocket_dev.regs);
-	pci_iounmap(pdev, vmsocket_dev.host_inbuffer);
-	pci_iounmap(pdev, vmsocket_dev.host_outbuffer);
+	pci_iounmap(pdev, vmsocket_dev.inbuffer);
+	pci_iounmap(pdev, vmsocket_dev.outbuffer);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
-	kfree(vmsocket_dev.guest_inbuffer);
-	kfree(vmsocket_dev.guest_outbuffer);
 	if(fc != NULL) {
 		class_destroy(fc);
 		fc = NULL;

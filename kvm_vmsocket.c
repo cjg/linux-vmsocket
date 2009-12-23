@@ -77,6 +77,7 @@ struct vmsocket_dev {
 
 static struct vmsocket_dev vmsocket_dev;
 static atomic_t vmsocket_available = ATOMIC_INIT(1);
+static struct class *fc = NULL;
 int vmsocket_major = VMSOCKET_MAJOR;
 int vmsocket_minor = 0;
 
@@ -298,6 +299,13 @@ static int vmsocket_probe (struct pci_dev *pdev,
 		      vmsocket_dev.outbuffer_size, vmsocket_dev.outbuffer_addr);
 
 	memset(vmsocket_dev.host_inbuffer, 'a', 100);
+
+	/* create sysfs entry */
+	if(fc == NULL)
+		fc = class_create(THIS_MODULE, "vmsocket");
+	device_create(fc, NULL, vmsocket_dev.cdev.dev, "%s%d", "vmsocket", 
+		      vmsocket_minor);
+
 	return 0;
 
   out_release:
@@ -322,6 +330,11 @@ static void vmsocket_remove(struct pci_dev* pdev)
 	pci_disable_device(pdev);
 	kfree(vmsocket_dev.guest_inbuffer);
 	kfree(vmsocket_dev.guest_outbuffer);
+	if(fc != NULL) {
+		class_destroy(fc);
+		fc = NULL;
+	}
+		
 }
 
 static struct pci_driver vmsocket_pci_driver = {

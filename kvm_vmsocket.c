@@ -134,6 +134,10 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 		return -ERESTARTSYS;
 
 	vmsocket_write_commit(dev);
+
+	if(count > dev->inbuffer_size)
+		count = dev->inbuffer_size;
+
 	writel(count, VMSOCKET_READ_L_REG(dev));
 	count = readl(VMSOCKET_STATUS_L_REG(dev));
 

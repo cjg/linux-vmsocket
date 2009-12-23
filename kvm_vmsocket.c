@@ -323,6 +323,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 static void vmsocket_remove(struct pci_dev* pdev)
 {
 	VMSOCKET_INFO("unregistered device.");
+	device_destroy(fc, vmsocket_dev.cdev.dev);
 	pci_iounmap(pdev, vmsocket_dev.regs);
 	pci_iounmap(pdev, vmsocket_dev.host_inbuffer);
 	pci_iounmap(pdev, vmsocket_dev.host_outbuffer);

@@ -12,6 +12,7 @@
 #include <linux/seq_file.h>
 #include <linux/cdev.h>
 #include <linux/pci.h>
+#include <linux/interrupt.h>
 
 #include <asm/system.h>		/* cli(), *_flags */
 #include <asm/uaccess.h>	/* copy_*_user */
@@ -48,11 +49,14 @@ MODULE_LICENSE("GPL");
 /* Registers */
 /* Read Only */
 #define VMSOCKET_STATUS_L_REG(dev)       ((dev)->regs)
+#define VMSOCKET_READ_END_L_REG(dev)     ((dev)->regs + 0x80)
+#define VMSOCKET_INTR_GET_L_REG(dev)     ((dev)->regs + 0xA0)
 /* Write Only */
 #define VMSOCKET_CONNECT_W_REG(dev)      ((dev)->regs + 0x20)
 #define VMSOCKET_CLOSE_W_REG(dev)        ((dev)->regs + 0x30)
 #define VMSOCKET_WRITE_COMMIT_L_REG(dev) ((dev)->regs + 0x40)
-#define VMSOCKET_READ_L_REG(dev)         ((dev)->regs + 0x60)
+#define VMSOCKET_READ_BEGIN_L_REG(dev)   ((dev)->regs + 0x60)
+#define VMSOCKET_INTR_SET_L_REG(dev)     ((dev)->regs + 0xC0)
 
 struct vmsocket_dev {
 	void __iomem * regs;
@@ -71,6 +75,9 @@ struct vmsocket_dev {
 
 	struct semaphore sem;
 	struct cdev cdev;
+
+	wait_queue_head_t wait_queue;
+	int wait_cond;
 } kvm_vmsocket_device;
 
 static struct vmsocket_dev vmsocket_dev;
@@ -78,14 +85,6 @@ static atomic_t vmsocket_available = ATOMIC_INIT(1);
 static struct class *fc = NULL;
 int vmsocket_major = VMSOCKET_MAJOR;
 int vmsocket_minor = 0;
-
-static void vmsocket_write_commit(struct vmsocket_dev *dev) 
-{
-	if(dev->outbuffer_length > 0) {
-		writel(dev->outbuffer_length, VMSOCKET_WRITE_COMMIT_L_REG(dev));
-		dev->outbuffer_length = 0;
-	}
-}
 
 static int vmsocket_open(struct inode *inode, struct file *filp)
 {
@@ -116,7 +115,6 @@ static int vmsocket_release(struct inode *inode, struct file *filp)
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 	
-	vmsocket_write_commit(dev);
 	writew(0xFFFF, VMSOCKET_CLOSE_W_REG(dev));
 	if((status = readl(VMSOCKET_STATUS_L_REG(&vmsocket_dev))) != 0) 
 		VMSOCKET_ERR("can't close connection.");
@@ -133,13 +131,14 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 
-	vmsocket_write_commit(dev);
-
 	if(count > dev->inbuffer_size)
 		count = dev->inbuffer_size;
 
-	writel(count, VMSOCKET_READ_L_REG(dev));
-	count = readl(VMSOCKET_STATUS_L_REG(dev));
+	writel(count, VMSOCKET_READ_BEGIN_L_REG(dev));
+
+	dev->wait_cond = 1;
+	wait_event_interruptible(dev->wait_queue, (dev->wait_cond == 0));
+	count = readl(VMSOCKET_READ_END_L_REG(dev));
 
 	if (count == 0) {
 		*f_pos = 0;
@@ -184,33 +183,14 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 	}
 
 	dev->outbuffer_length += count;
-	if(dev->outbuffer_length == dev->outbuffer_size)
-		vmsocket_write_commit(dev);
+	if(dev->outbuffer_length > 0) {
+		writel(dev->outbuffer_length, VMSOCKET_WRITE_COMMIT_L_REG(dev));
+		dev->outbuffer_length = 0;
+	}
 
 	*f_pos += count;
 	up(&dev->sem);
 	return count;
-}
-
-static int vmsocket_flush(struct file *filp) {
-	struct vmsocket_dev *dev = filp->private_data;
-
-	if (down_interruptible(&dev->sem))
-		return -ERESTARTSYS;
-
-	vmsocket_write_commit(dev);
-
-	up(&dev->sem);
-	return 0;
-}
-
-int vmsocket_ioctl(struct inode *inode,	/* see include/linux/fs.h */
-		   struct file *file,	/* ditto */
-		   unsigned int ioctl_num,	/* number and param for ioctl */
-		   unsigned long ioctl_param) {
-	
-	PDEBUG("ioctl(): num: %u param: %lu\n", ioctl_num, ioctl_param);
-	return 0;
 }
 
 static const struct file_operations vmsocket_fops = {
@@ -219,9 +199,6 @@ static const struct file_operations vmsocket_fops = {
     .release = vmsocket_release,
     .read    = vmsocket_read,
     .write   = vmsocket_write,
-    .flush   = vmsocket_flush,
-    /* .fsync   = vmsocket_fsync, */
-    /* .ioctl   = vmsocket_ioctl, */
 };
 
 static struct pci_device_id kvm_vmsocket_id_table[] = {
@@ -229,6 +206,23 @@ static struct pci_device_id kvm_vmsocket_id_table[] = {
     { 0 },
 };
 MODULE_DEVICE_TABLE (pci, kvm_vmsocket_id_table);
+
+static irqreturn_t vmsocket_interrupt (int irq, void *dev_instance, 
+				       struct pt_regs * regs)
+{
+	struct vmsocket_dev *dev = dev_instance;
+
+	if (unlikely(dev == NULL) || !readl(VMSOCKET_INTR_GET_L_REG(dev)))
+		return IRQ_NONE;
+
+	writel(0, VMSOCKET_INTR_SET_L_REG(dev));
+
+	dev->wait_cond = 0; 
+	wake_up_interruptible(&dev->wait_queue); 
+
+	return IRQ_HANDLED;
+}
+
 
 static int vmsocket_probe (struct pci_dev *pdev, 
 			   const struct pci_device_id * ent)
@@ -277,6 +271,12 @@ static int vmsocket_probe (struct pci_dev *pdev,
 		goto out_release;
 	}
 
+	/* IRQ */
+	if (request_irq(pdev->irq, vmsocket_interrupt, IRQF_SHARED,
+                        "kvm_vmsocket", &vmsocket_dev))
+		VMSOCKET_ERR("cannot get interrupt %d\n", pdev->irq);
+
+	init_waitqueue_head(&vmsocket_dev.wait_queue);
 	init_MUTEX(&vmsocket_dev.sem);
 	cdev_init(&vmsocket_dev.cdev, &vmsocket_fops);
 	vmsocket_dev.cdev.owner = THIS_MODULE;
@@ -316,6 +316,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 static void vmsocket_remove(struct pci_dev* pdev)
 {
 	VMSOCKET_INFO("unregistered device.");
+	free_irq(pdev->irq, &vmsocket_dev);
 	device_destroy(fc, vmsocket_dev.cdev.dev);
 	pci_iounmap(pdev, vmsocket_dev.regs);
 	pci_iounmap(pdev, vmsocket_dev.inbuffer);

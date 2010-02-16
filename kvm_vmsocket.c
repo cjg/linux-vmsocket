@@ -74,6 +74,7 @@ struct vmsocket_dev {
 	uint32_t outbuffer_addr;
 
 	struct semaphore sem;
+	struct semaphore semro;
 	struct cdev cdev;
 
 	wait_queue_head_t wait_queue;
@@ -128,7 +129,7 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 {
 	struct vmsocket_dev *dev = filp->private_data;
 
-	if (down_interruptible(&dev->sem))
+	if (down_interruptible(&dev->semro))
 		return -ERESTARTSYS;
 
 	if(count > dev->inbuffer_size)
@@ -142,17 +143,17 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 
 	if (count == 0) {
 		*f_pos = 0;
-		up(&dev->sem);
+		up(&dev->semro);
 		return 0;
 	}
 
 	if(copy_to_user(buf, dev->inbuffer, count) > 0) {
-		up(&dev->sem);
+		up(&dev->semro);
 		return -EFAULT;
 	}
 
 	*f_pos += count;
-	up(&dev->sem);
+	up(&dev->semro);
 	return count;
 }
 
@@ -278,6 +279,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 
 	init_waitqueue_head(&vmsocket_dev.wait_queue);
 	init_MUTEX(&vmsocket_dev.sem);
+	init_MUTEX(&vmsocket_dev.semro);
 	cdev_init(&vmsocket_dev.cdev, &vmsocket_fops);
 	vmsocket_dev.cdev.owner = THIS_MODULE;
 	vmsocket_dev.cdev.ops = &vmsocket_fops;

@@ -16,6 +16,7 @@
 
 #include <asm/system.h>		/* cli(), *_flags */
 #include <asm/uaccess.h>	/* copy_*_user */
+#include <linux/sched.h>
 
 MODULE_DESCRIPTION("Guest driver for the VMSocket PCI Device.");
 MODULE_AUTHOR("Giuseppe Coviello <cjg@cruxppc.org>");
@@ -135,9 +136,9 @@ static ssize_t vmsocket_read(struct file *filp, char __user *buf, size_t count,
 	if(count > dev->inbuffer_size)
 		count = dev->inbuffer_size;
 
+	dev->wait_cond = 1;
 	writel(count, VMSOCKET_READ_BEGIN_L_REG(dev));
 
-	dev->wait_cond = 1;
 	wait_event_interruptible(dev->wait_queue, (dev->wait_cond == 0));
 	count = readl(VMSOCKET_READ_END_L_REG(dev));
 
@@ -176,7 +177,6 @@ static ssize_t vmsocket_write(struct file *filp, const char __user *buf,
 		up(&dev->sem);
 		return 0;
 	}
-
 	if(copy_from_user(dev->outbuffer + dev->outbuffer_length, buf, count) 
 	   > 0) {
 		up(&dev->sem);
@@ -208,8 +208,7 @@ static struct pci_device_id kvm_vmsocket_id_table[] = {
 };
 MODULE_DEVICE_TABLE (pci, kvm_vmsocket_id_table);
 
-static irqreturn_t vmsocket_interrupt (int irq, void *dev_instance, 
-				       struct pt_regs * regs)
+static irqreturn_t vmsocket_interrupt (int irq, void *dev_instance)
 {
 	struct vmsocket_dev *dev = dev_instance;
 
@@ -299,7 +298,7 @@ static int vmsocket_probe (struct pci_dev *pdev,
 	/* create sysfs entry */
 	if(fc == NULL)
 		fc = class_create(THIS_MODULE, "vmsocket");
-	device_create(fc, NULL, vmsocket_dev.cdev.dev, "%s%d", "vmsocket", 
+	device_create(fc, NULL, vmsocket_dev.cdev.dev, NULL, "%s%d", "vmsocket", 
 		      vmsocket_minor);
 
 	return 0;
